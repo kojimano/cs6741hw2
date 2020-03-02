@@ -95,15 +95,6 @@ def calc_sent_perplexity(probs, sent_len):
 
     return all_perplexity
 
-def calc_sent_log_probability(probs):
-    all_probs = torch.zeros(probs.shape[0])
-    all_probs = all_probs.cuda()
-
-    for seq_idx in range(probs.shape[1]):
-        all_probs += torch.log(probs[:, seq_idx])
-
-    return all_probs
-
 
 def save_model(model: nn.Module, model_name: str):
     if not os.path.exists("./checkpoints"):
@@ -213,7 +204,7 @@ def test_trigram(model: models.TrigramLM, test_iter: torchtext.data.BucketIterat
     for batch in iter(val_iter):
         for i in range(batch.text.shape["batch"]):
             seq = [i for i in batch.text[{"batch": i}].tolist()]
-            print(i)
+            print(total_samples)
             for j in range(len(seq) - n_gram + 1):
                 input = tuple([seq[j + k] for k in range(model._n-1)])
                 prob = model(input)
@@ -221,9 +212,11 @@ def test_trigram(model: models.TrigramLM, test_iter: torchtext.data.BucketIterat
                 target = torch.LongTensor([seq[j+model._n-1]])
                 loss = criterion(logit.unsqueeze(0),target)
                 total_loss += loss
+
                 total_samples += 1
-    embed()
-    avg_loss = total_loss / len(total_samples)
+        if total_samples > 5000:
+            break
+    avg_loss = total_loss / total_samples
     avg_perplexity = torch.exp(avg_loss)
     avg_loss = avg_loss.item()
     avg_perplexity = avg_perplexity.item()
@@ -231,97 +224,114 @@ def test_trigram(model: models.TrigramLM, test_iter: torchtext.data.BucketIterat
     return avg_perplexity
 
 def run_em(model: nn.Module, val_iter: torchtext.datasets, test_iter: torchtext.datasets):
-    max_turn = 3
+    max_turn = 10
+    max_samples = 500
+    n_gram = model._n
     alpha1 = 1/3.
     alpha2 = 1/3.
     alpha3 = 1 - alpha1 - alpha2
 
     for turn in range(max_turn):
-        # Prplexity calculation
-        print("Turn {}".format(turn))
-        print(alpha1, alpha2, alpha3)
-        test(model, test_iter)
-
         # Miscs
         all_sents_log_prob_alpha1 = []
         all_sents_log_prob_alpha2 = []
         all_sents_log_prob_alpha3 = []
-        # Maximization
-        for idx, batch in enumerate(val_iter):
-            batch.text = batch.text.t()
-            probs_alpha1, probs_alpha2, probs_alpha3 = model.em_forward(batch.text)
-            sents_probs_alpha1 = calc_sent_log_probability(probs_alpha1.cuda())
-            sents_probs_alpha2 = calc_sent_log_probability(probs_alpha2.cuda())
-            sents_probs_alpha3 = calc_sent_log_probability(probs_alpha3.cuda())
-
-            all_sents_log_prob_alpha1.append(sents_probs_alpha1)
-            all_sents_log_prob_alpha2.append(sents_probs_alpha2)
-            all_sents_log_prob_alpha3.append(sents_probs_alpha3)
+        total_samples = 0
+        total_probs = []
+        all_targets = []
 
         # Expectation
-        all_sents_prob_alpha1 = torch.cat(all_sents_log_prob_alpha1, 0)
-        all_sents_prob_alpha2 = torch.cat(all_sents_log_prob_alpha2, 0)
-        all_sents_prob_alpha3 = torch.cat(all_sents_log_prob_alpha3, 0)
+        for batch in iter(val_iter):
+            for i in range(batch.text.shape["batch"]):
+                seq = [i for i in batch.text[{"batch": i}].tolist()]
+                for j in range(len(seq) - n_gram + 1):
+                    input = tuple([seq[j + k] for k in range(model._n-1)])
+                    prob = model(input, em=True)
+                    target = torch.LongTensor([seq[j+model._n-1]])
+                    all_targets.append(target.item())
+                    total_probs.append(prob.numpy())
+                    total_samples += 1
+                if total_samples > max_samples:
+                    break
+            if total_samples > max_samples:
+                break
 
-        all_sents_prob_alpha1 = all_sents_prob_alpha1 - torch.mean(all_sents_prob_alpha3)
-        all_sents_prob_alpha2 = all_sents_prob_alpha2 - torch.mean(all_sents_prob_alpha3)
-        all_sents_prob_alpha3 = all_sents_prob_alpha3 - torch.mean(all_sents_prob_alpha3)
+        # Maximization
+        total_probs = np.stack(total_probs, 2)
+        all_targets = np.stack(all_targets, 0)
+        target_probs = total_probs[all_targets,:,[i for i in range(len(all_targets))]]
+        prob_alpha1 = np.mean(alpha1 * target_probs[:,0])
+        prob_alpha2 = np.mean(alpha2 * target_probs[:,1])
+        prob_alpha3 = np.mean(alpha3 * target_probs[:,2])
 
-        alpha1 = alpha1 * torch.sum(torch.exp(all_sents_prob_alpha1))
-        alpha2 = alpha2 * torch.sum(torch.exp(all_sents_prob_alpha2))
-        alpha3 = alpha3 * torch.sum(torch.exp(all_sents_prob_alpha3))
-        alpha1 = alpha1 / (alpha1 + alpha2 + alpha3)
-        alpha2 = alpha2 / (alpha1 + alpha2 + alpha3)
-        alpha3 = alpha3 / (alpha1 + alpha2 + alpha3)
-        model.set_alpha(alpha1.item(), alpha2.item(), alpha3.item())
+        alpha1, alpha2, alpha3 = prob_alpha1, prob_alpha2, prob_alpha3
+        norm = (alpha1 + alpha2 + alpha3)
+        alpha1 = alpha1 / norm
+        alpha2 = alpha2 / norm
+        alpha3 = alpha3 / norm
+        model.set_alpha(alpha1, alpha2, alpha3)
+        print(alpha1, alpha2, alpha3)
 
 
-def analysis(train_txt, test_txt, word_vec):
+# TODO maybe worng model ... retraining can be option
+def analysis(train_iter):
 
     import torch.nn.functional as F
-
-    tg_model = get_model("tg", train_txt, None)
-    nn_model = get_model("nn", train_txt, None)
-    nn_model.load_state_dict(torch.load("./checkpoints/best-nn-score-614.304-epoch-29.pkl"))
-    lstm_model = get_model("lstm", train_txt, None)
-    lstm_model.load_state_dict(torch.load("./checkpoints/best-lstm-score-7484.329-epoch-0.pkl"))
-    tg_model.cuda()
-    nn_model.cuda()
-    lstm_model.cuda()
+    # Get models
+    tg_model = get_model("tg", train_iter, None)
+    nn_model = get_model("nn", train_iter, None)
+    nn_model.load_state_dict(torch.load("./checkpoints/best-nn-score-326.637-epoch-49.pkl"))
+    lstm_model = get_model("lstm", train_iter, None)
+    lstm_model.load_state_dict(torch.load("./checkpoints/best-lstm-score-154.297-epoch-49.pkl"))
+    if torch.cuda.is_available():
+        tg_model.cuda()
+        nn_model.cuda()
+        lstm_model.cuda()
     tg_model.eval()
     nn_model.eval()
     lstm_model.eval()
 
-    print(train_txt.examples[0].text[97:104])
-    train_context1 = torch.Tensor([TEXT.vocab.stoi[tk] for tk in train_txt.examples[0].text[97:104]]).long().cuda().unsqueeze(0)
-    print(train_txt.examples[0].text[95:100])
-    train_context2 = torch.Tensor([TEXT.vocab.stoi[tk] for tk in train_txt.examples[0].text[101:109]]).long().cuda().unsqueeze(0)
-    print(train_txt.examples[0].text[95:100])
-    train_context3 = torch.Tensor([TEXT.vocab.stoi[tk] for tk in train_txt.examples[0].text[150:154]]).long().cuda().unsqueeze(0)
+    # Get train context
+    print(train_txt.examples[0].text[93:104])
+    context1 = torch.Tensor([TEXT.vocab.stoi[tk] for tk in train_txt.examples[0].text[93:104]]).long().cuda().unsqueeze(0)
+    print(train_txt.examples[0].text[210:221])
+    context2 = torch.Tensor([TEXT.vocab.stoi[tk] for tk in train_txt.examples[0].text[210:221]]).long().cuda().unsqueeze(0)
+    print(test_txt.examples[0].text[12:24])
+    context3 = torch.Tensor([TEXT.vocab.stoi[tk] for tk in test_txt.examples[0].text[12:24]]).long().cuda().unsqueeze(0)
+    print(test_txt.examples[0].text[220:231])
+    context4 = torch.Tensor([TEXT.vocab.stoi[tk] for tk in test_txt.examples[0].text[220:231]]).long().cuda().unsqueeze(0)
+    contexts = [context1, context2, context3, context4]
 
-    train_examples = torch.cat([train_context1, train_context2, train_context3], 0)
+    # Get test context
+    KL_loss = nn.KLDivLoss()
+    for context in contexts:
+        context.cuda()
+        max_idx = context[0][-1].item()
+        print("Ground-truth {}".format(TEXT.vocab.itos[max_idx]))
+        # Trigram
+        tg_probs = tg_model(tuple([context[0][-2].item(), context[0][-1].item()]))
+        tg_probs = tg_probs.cuda().unsqueeze(0)
+        max_idx = torch.argmax(tg_probs)
+        print("Pred: {}, Entophy {}".format(TEXT.vocab.itos[max_idx], Categorical(tg_probs).entropy()))
 
-    test_context1 = []
-    test_context2 = []
-    test_context3 = []
-    test_examples = [test_context1, test_context2, test_context3]
+        # NN
+        nn_probs = nn_model(context[0][-6:-1].unsqueeze(0))[:,-1,:]
+        nn_probs = F.softmax(nn_probs)
+        max_idx = torch.argmax(nn_probs)
+        print("Pred: {}, Entophy {}".format(TEXT.vocab.itos[max_idx], Categorical(nn_probs).entropy() ))
 
-    train_kl_tables = torch.zeros(3, 3, len(train_examples))
-    train_ent_tables = torch.zeros(3, len(train_examples))
+        # LSTM
+        lstm_probs = lstm_model(context[0][:-1].unsqueeze(0))[:,-1,:]
+        lstm_probs = F.softmax(lstm_probs)
+        max_idx = torch.argmax(lstm_probs)
+        print("Pred: {}, Entophy {}".format(TEXT.vocab.itos[max_idx], Categorical(lstm_probs).entropy()))
 
-    tg_probs = tg_model.analysis(train_examples)
-    tg_probs = tg_probs.cuda()
-    nn_probs = F.softmax(nn_model(train_examples), 2)[:,-1,:]
-    lstm_probs = F.softmax(lstm_model(train_examples), 2)[:,-1,:]
-    train_ent_tables[0,i] =  Categorical(tg_probs).entropy()
-    train_ent_tables[1,i] = Categorical(nn_probs).entropy()
-    train_ent_tables[2,i] = Categorical(lstm_probs).entropy()
+        # KL divergence
+        print(KL_loss(nn_probs.log(), lstm_probs))
+        print(KL_loss(nn_probs.log(), tg_probs))
+        print(KL_loss(lstm_probs.log(), tg_probs))
 
-    """
-    train_kl_tables[0,1,i] = F.kl_div(tg_probs, tg_probs)
-    train_kl_tables[0,2,i] = F.kl_div(tg_probs, nn_probs)
-    train_kl_tables[1,2,i] = F.kl_div(nn_probs, lstm_probs)
-    """
+
 
 
 if __name__=="__main__":
@@ -329,7 +339,7 @@ if __name__=="__main__":
     train_iter, val_iter, test_iter = LMDataset.splits(
         (train_txt, val_txt, test_txt), batch_size=10, device=torch.device("cuda"), bptt_len=32, repeat=False)
     if args.analysis:
-        analysis(train_txt, test_txt, word_vec)
+        analysis(train_iter)
     else:
         # Model instantiation
         model = get_model(args.model_type, train_iter, word_vec) if args.use_word_vec else get_model(args.model_type, train_iter, None)

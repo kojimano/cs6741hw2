@@ -24,7 +24,7 @@ class TrigramLM(nn.Module):
         self._vocab_size = vocab_size
         self._n = 3
         #self._alphas = np.array([0.33, 0.33, 1-0.66])
-        self._alphas = np.array([0.1, 0.8, 0.1])
+        self._alphas = np.array([0., 0., 1.])
         self._grams = [Counter()] + [{} for _ in range(1, self._n)]
 
     def set_alpha(self, alpha_1: float, alpha_2: float, alpha_3: float):
@@ -32,10 +32,7 @@ class TrigramLM(nn.Module):
         alpha_1 = alpha_1 / float(norm)
         alpha_2 = alpha_2 / float(norm)
         alpha_3 = alpha_3 / float(norm)
-
-        self._alpha_1 = nn.Parameter(torch.tensor(alpha_1))
-        self._alpha_2 = nn.Parameter(torch.tensor(alpha_2))
-        self._alpha_3 = nn.Parameter(torch.tensor(alpha_3))
+        self._alphas = np.array([alpha_1, alpha_2, alpha_3])
 
     def set_ngrams(self, train_iter: torchtext.data.BucketIterator):
         totalNumWords = 0
@@ -57,8 +54,11 @@ class TrigramLM(nn.Module):
             totalNumWords += len(values)
         self._grams[0][-1] = totalNumWords
 
-    def forward(self, x: torch.FloatTensor,  smooth: int = 1):
-        output = torch.zeros(self._vocab_size)
+    def forward(self, x: torch.FloatTensor,  smooth: int = 1, em=False):
+        if em:
+            output = torch.zeros(self._vocab_size, 3)
+        else:
+            output = torch.zeros(self._vocab_size)
         for i in range(self._vocab_size):
             preds = []
             for n in range(self._n):
@@ -81,68 +81,14 @@ class TrigramLM(nn.Module):
                 else:
                     pred = tup_dict[key] / float(tup_dict[-1])
                 preds.append(pred)
-            preds = np.array(preds)
-            output[i] = np.dot(preds, self._alphas)
-
+            if em:
+                preds = torch.Tensor(preds)
+                output[i, :] = preds
+            else:
+                preds = np.array(preds)
+                output[i] = np.dot(preds, self._alphas)
         return output
-    """
-    def em_forward(self, x: torch.FloatTensor, smooth: int = 1):
-        batch_probs_alpha1 = []
-        batch_probs_alpha2 = []
-        batch_probs_alpha3 = []
 
-        for batch_idx in range(x.shape[0]):
-            sent = x[batch_idx, :].cpu()
-            if torch.cuda.is_available():
-                sent = sent.cpu()
-            sent = sent.numpy()
-            uni_grams = generate_ngrams(sent)
-            bi_grams = [None] + generate_ngrams(sent, 2)
-            tri_grams = [None, None] + generate_ngrams(sent, 3)
-
-            sent_probs_alpha_1 = []
-            sent_probs_alpha_2 = []
-            sent_probs_alpha_3 = []
-
-            for i in range(len(uni_grams)):
-                norm = 0
-
-                uni_term = self._unigrams[uni_grams[i]]
-                prob1 = self._alpha_1 * (uni_term + smooth) / (np.sum(list(self._unigrams.values())) + smooth)
-
-                # Unigram term
-                numerator = self._unigrams[uni_grams[i]] + smooth
-                denominator = np.sum(list(self._unigrams.values())) + smooth
-                prob += self._alpha_1 * numerator / denominator
-                alpha_norm += self._alpha_1
-
-                # Bigram term
-                if bi_grams[i] is not None:
-                    numerator = 0 if bi_grams[i] not in self._bigrams.keys() else self._bigrams[bi_grams[i]]
-                    numerator += smooth
-                    denominator = self._unigrams[uni_grams[i-1]] + smooth
-                    prob2 += self._alpha_2 * numerator / denominator
-                    alpha_norm += self._alpha_2
-
-                # Trigram term
-                if tri_grams[i] is not None:
-                    numerator = 0 if tri_grams[i] not in self._trigrams.keys() else self._trigrams[tri_grams[i]]
-                    numerator += smooth
-                    denominator = 0 if bi_grams[i-2] not in self._bigrams.keys() else self._bigrams[bi_grams[i-2]]
-                    denominator += smooth
-                    prob3 += self._alpha_3 * numerator / denominator
-                    alpha_norm += self._alpha_3
-
-                sent_probs_alpha_1.append(prob1)
-                sent_probs_alpha_2.append(prob2)
-                sent_probs_alpha_3.append(prob3)
-
-            batch_probs_alpha1.append(torch.stack(sent_probs_alpha_1, 0))
-            batch_probs_alpha2.append(torch.stack(sent_probs_alpha_2, 0))
-            batch_probs_alpha3.append(torch.stack(sent_probs_alpha_3, 0))
-
-        return torch.stack(batch_probs_alpha1, 0), torch.stack(batch_probs_alpha2, 0), torch.stack(batch_probs_alpha3, 0)
-    """
 
 class NeuralNetLM(nn.Module):
     """
