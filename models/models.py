@@ -23,8 +23,8 @@ class TrigramLM(nn.Module):
         super().__init__()
         self._vocab_size = vocab_size
         self._n = 3
-        #self._alphas = np.array([0.33, 0.33, 1-0.66])
-        self._alphas = np.array([0., 0., 1.])
+        self._alphas = np.array([0.33, 0.33, 1-0.66])
+        #self._alphas = np.array([0., 0., 1.])
         self._grams = [Counter()] + [{} for _ in range(1, self._n)]
 
     def set_alpha(self, alpha_1: float, alpha_2: float, alpha_3: float):
